@@ -13,6 +13,20 @@
 
 安装完成后会向 `~/.bashrc` 写入集成配置（幂等，重复执行不会重复追加），并设置各语言为默认版本（`sdk` 默认 / `fnm default` / `gvm use --default` / `pyenv global`）。
 
+## 一键安装（无需克隆仓库）
+
+与 gvm 等工具的文档一样，可以直接用命令行下载并执行 `setup.sh`，无需先克隆仓库：
+
+```bash
+# gvm 文档风格：进程替换直接执行（不落盘）
+bash < <(curl -s -S -L https://raw.githubusercontent.com/juhkff/wsl-command-init/main/setup.sh)
+
+# 需要传参数时（-s 表示脚本从 stdin 读取，-- 后的参数传给脚本）：
+curl -s -S -L https://raw.githubusercontent.com/juhkff/wsl-command-init/main/setup.sh | bash -s -- --no-apt
+```
+
+> 注意：`bash < <(curl ...) --参数` 这种写法会把 `--参数` 当作 bash 自身的选项，不会传给脚本；带参数请使用 `curl ... | bash -s -- ...`。
+
 ## 用法
 
 ```bash
