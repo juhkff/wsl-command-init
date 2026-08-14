@@ -20,10 +20,12 @@
 #   HOME=/tmp/test-home bash setup.sh   # 所有工具装到临时 HOME 下
 #   或单独覆盖：SDKMAN_DIR / FNM_DIR / GVM_ROOT / PYENV_ROOT / RC_FILE
 #
-# 镜像说明（默认值均已实测可用，可用同名环境变量覆盖）：
+# 镜像说明（可用同名环境变量覆盖）：
 #   - sdkman 国内暂无公共 API 镜像，默认官方 https://api.sdkman.io/2
-#   - fnm   默认华为云 https://mirrors.huaweicloud.com/nodejs/
-#            （npmmirror 与 nodejs.org 在部分网络下对 fnm 不可用）
+#   - fnm   默认自动探测首个可用镜像（官方 → 清华 → 华为云 → npmmirror → 腾讯云）。
+#           注意：华为云/npmmirror/腾讯云对 fnm 的 rustls TLS 栈不兼容
+#           （服务器仅支持 TLS1.2 且拒绝 h2，rustls 客户端请求报错或挂起），
+#           官方 nodejs.org 与清华镜像实测可用。
 #   - gvm   默认 golang.google.cn（Google 官方国内镜像）
 #   - pyenv 默认 npmmirror https://registry.npmmirror.com/-/binary/python
 #            （新版 python-build 需配合 PYTHON_BUILD_MIRROR_URL_SKIP_CHECKSUM=1）
@@ -40,7 +42,18 @@ PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 RC_FILE="${RC_FILE:-$HOME/.bashrc}"
 
 SDKMAN_CANDIDATES_API="${SDKMAN_CANDIDATES_API:-https://api.sdkman.io/2}"
-FNM_NODE_DIST_MIRROR="${FNM_NODE_DIST_MIRROR:-https://mirrors.huaweicloud.com/nodejs/}"
+# fnm 镜像：优先使用用户显式设置的 FNM_NODE_DIST_MIRROR；未设置时按
+# NODE_MIRROR_CANDIDATES 顺序自动探测第一个可用的（用 fnm 实测，见 pick_node_mirror）。
+# 华为云等镜像仅支持 TLS1.2 且拒绝 h2，与 fnm 的 rustls TLS 栈不兼容，
+# 因此排在候选列表末尾，且探测时用 timeout 兜底防止挂起。
+FNM_NODE_DIST_MIRROR_USER="${FNM_NODE_DIST_MIRROR:-}"
+NODE_MIRROR_CANDIDATES=(
+  "https://nodejs.org/dist"
+  "https://mirrors.tuna.tsinghua.edu.cn/nodejs-release"
+  "https://mirrors.huaweicloud.com/nodejs/"
+  "https://registry.npmmirror.com/-/binary/node"
+  "https://mirrors.tencent.com/nodejs-release"
+)
 GO_BINARY_BASE_URL="${GO_BINARY_BASE_URL:-https://golang.google.cn/dl}"
 GO_VERSION_URL="${GO_VERSION_URL:-https://golang.google.cn/VERSION?m=text}"
 # Python 源码下载镜像。新版 python-build 的 PYTHON_BUILD_MIRROR_URL 只接受
@@ -181,9 +194,17 @@ install_system_deps() {
   sudo apt-get update -qq
   sudo apt-get install -y \
     curl git unzip zip ca-certificates \
-    build-essential xz-utils bzip2 \
+    build-essential xz-utils bzip2 bison tk-dev \
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
     libsqlite3-dev libffi-dev liblzma-dev
+  # gvm 依赖 hexdump（旧版由 bsdmainutils 提供；部分新版 Ubuntu 改由 bsdutils 提供）
+  if ! command -v hexdump >/dev/null 2>&1; then
+    if apt-cache show bsdmainutils >/dev/null 2>&1; then
+      sudo apt-get install -y bsdmainutils
+    else
+      sudo apt-get install -y bsdutils
+    fi
+  fi
 }
 
 # ------------------------------ sdkman + 最新 Oracle Java ------------------------------
@@ -219,6 +240,28 @@ install_latest_java() {
 }
 
 # ------------------------------ fnm + 最新 Node.js ------------------------------
+# 选择 Node.js 下载镜像：用户显式设置过 FNM_NODE_DIST_MIRROR 则直接用；
+# 否则按 NODE_MIRROR_CANDIDATES 顺序用 fnm 实测（ls-remote）选第一个可用的。
+# 注意：不能只用 curl 探测 —— 华为云等镜像 curl 可访问但对 fnm 的 rustls
+# TLS 栈不可用；且部分镜像会挂起，故用 timeout 兜底。
+pick_node_mirror() {
+  if [ -n "$FNM_NODE_DIST_MIRROR_USER" ]; then
+    FNM_NODE_DIST_MIRROR="$FNM_NODE_DIST_MIRROR_USER"
+    log "使用用户指定的 Node.js 镜像: $FNM_NODE_DIST_MIRROR"
+    return 0
+  fi
+  local m
+  for m in "${NODE_MIRROR_CANDIDATES[@]}"; do
+    if timeout 20 env FNM_NODE_DIST_MIRROR="$m" fnm ls-remote >/dev/null 2>&1; then
+      FNM_NODE_DIST_MIRROR="$m"
+      log "Node.js 镜像可用: $m"
+      return 0
+    fi
+    warn "Node.js 镜像不可用，尝试下一个: $m"
+  done
+  err "所有 Node.js 镜像均不可用，请检查网络（或设置 FNM_NODE_DIST_MIRROR 指定可用镜像）"
+}
+
 install_fnm() {
   if [ ! -x "$FNM_DIR/fnm" ]; then
     log "安装 fnm 到 $FNM_DIR ..."
@@ -246,6 +289,7 @@ install_fnm() {
   export FNM_NODE_DIST_MIRROR
   fnm --version >/dev/null 2>&1 || err "fnm 不可用"
   log "fnm 就绪: $(fnm --version)"
+  pick_node_mirror
 }
 
 install_latest_node() {
@@ -322,6 +366,13 @@ install_latest_python() {
 # ------------------------------ bashrc 集成 ------------------------------
 write_rc() {
   local marker="# >>> wsl-command-init >>>"
+  # 清理 gvm 安装脚本追加在块外的重复 source 行（gvm 被 source 两次会让
+  # cd hook 被二次包装，终端一打开就因无限递归崩溃退出）。
+  # 只删“绝对路径/引号形式”的行，保留块内使用 $GVM_ROOT 变量的行。
+  if [ -f "$RC_FILE" ]; then
+    grep -v '\[\[ -s ".*\.gvm/scripts/gvm" \]\] && source ".*\.gvm/scripts/gvm"' "$RC_FILE" > "$RC_FILE.tmp" \
+      && mv "$RC_FILE.tmp" "$RC_FILE"
+  fi
   if grep -qF "$marker" "$RC_FILE" 2>/dev/null; then
     log "$RC_FILE 已包含初始化块，跳过写入"
     return 0
@@ -346,10 +397,12 @@ export GVM_ROOT="${GVM_ROOT:-$HOME/.gvm}"
 # --- fnm ---
 export FNM_DIR="${FNM_DIR:-$HOME/.local/share/fnm}"
 export PATH="$FNM_DIR:$PATH"
-export FNM_NODE_DIST_MIRROR="${FNM_NODE_DIST_MIRROR:-https://mirrors.huaweicloud.com/nodejs/}"
+export FNM_NODE_DIST_MIRROR="${FNM_NODE_DIST_MIRROR:-__FNM_NODE_DIST_MIRROR__}"
 eval "$(fnm env --use-on-cd --shell bash)"
 # <<< wsl-command-init <<<
 EOF
+  # 把上面占位符替换为本次安装实际选中的镜像（若未安装 node，默认官方 nodejs.org）
+  sed -i "s|__FNM_NODE_DIST_MIRROR__|${FNM_NODE_DIST_MIRROR:-https://nodejs.org/dist}|" "$RC_FILE"
   log "已写入 $RC_FILE（重新打开终端或执行 source $RC_FILE 生效）"
 }
 
@@ -366,6 +419,7 @@ print_versions() {
   if [ "$DO_NODE" = 1 ]; then
     if [ -x "$FNM_DIR/fnm" ]; then
       export PATH="$FNM_DIR:$PATH" FNM_NODE_DIST_MIRROR
+      pick_node_mirror
       printf '%-8s %s\n' "node" "$(latest_node)"
     else
       printf '%-8s %s\n' "node" "fnm 未安装，跳过"
