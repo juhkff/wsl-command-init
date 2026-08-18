@@ -381,6 +381,15 @@ write_rc() {
   cat >> "$RC_FILE" <<'EOF'
 
 # >>> wsl-command-init >>>
+# 防重入守卫：sdkman/pyenv 无碍，但 gvm 与 fnm 都会 hook cd()，在同一
+# 交互 shell 内二次 source（如新终端里手动执行 source ~/.bashrc）会让两份
+# cd hook 被重复包装，导致无限递归、终端段错误退出(139)。首次加载本块后
+# 置位标记，再次进入直接返回，避免重复包装（不影响手动重载其他配置）。
+if [ -n "${WSL_COMMAND_INIT_LOADED:+1}" ]; then
+  return
+fi
+export WSL_COMMAND_INIT_LOADED=1
+
 # --- sdkman ---
 export SDKMAN_DIR="${SDKMAN_DIR:-$HOME/.sdkman}"
 [[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ]] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
